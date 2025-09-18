@@ -13,6 +13,7 @@ ctv_cloud_env.py  (with iFLYTEK Private WS TTS integrated)
 """
 
 import argparse, os, re, sys, tempfile, subprocess, base64, time, json, asyncio, ssl, hashlib, hmac, urllib.parse, zipfile
+from contextlib import ExitStack
 from io import BytesIO
 from urllib.parse import urlparse
 from pathlib import Path
@@ -45,6 +46,25 @@ def _maybe_int(value: Optional[Any]) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _maybe_float(value: Optional[Any]) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _env_for_emotion(key: str, emotion: Optional[str]) -> Optional[str]:
+    if not key:
+        return None
+    if emotion:
+        emo_key = f"{key}_{emotion.upper()}"
+        if emo_key in os.environ:
+            return os.getenv(emo_key)
+    return os.getenv(key)
 
 # ---------------- 基础工具 ----------------
 def natural_key(s: str):
@@ -482,6 +502,104 @@ def save_audio_chatts_from_sentences(sentences: List[str], api_url: str,
         final_seg += seg
     final_seg.export(out_path, format="mp3")
 
+
+def save_audio_indextts_from_sentences(
+    sentences: List[str],
+    api_url: str,
+    prompt_wav: str,
+    emo_wav: Optional[str],
+    emo_text: Optional[str],
+    use_emo_text: bool,
+    emo_alpha: float,
+    emo_vector_json: Optional[str],
+    use_random: bool,
+    interval_silence: Optional[int],
+    max_text_tokens: Optional[int],
+    temperature: Optional[float],
+    top_p: Optional[float],
+    top_k: Optional[int],
+    repetition_penalty: Optional[float],
+    max_mel_tokens: Optional[int],
+    timeout: float,
+    out_path: Path,
+    on_empty: str,
+):
+    sents = [s.strip() for s in sentences if s.strip()]
+    if not sents:
+        if on_empty == "silence":
+            AudioSegment.silent(duration=600).export(out_path, format="mp3")
+            return
+        sents = ["这一页没有可读文本"]
+
+    if not api_url:
+        raise RuntimeError("缺少 IndexTTS API 地址（INDEXTTS_API_URL）")
+    if not prompt_wav or not os.path.exists(prompt_wav):
+        raise RuntimeError("缺少 IndexTTS 参考音频（INDEXTTS_PROMPT_WAV）")
+    emo_wav = emo_wav.strip() if emo_wav else None
+    if emo_wav:
+        if not os.path.exists(emo_wav):
+            raise RuntimeError(f"IndexTTS 情感参考音频不存在：{emo_wav}")
+
+    text = join_for_tts(sents, sep=' ')
+
+    data: Dict[str, Any] = {
+        "text": text,
+        "use_emo_text": "true" if use_emo_text else "false",
+        "emo_alpha": str(float(emo_alpha if emo_alpha is not None else 1.0)),
+        "use_random": "true" if use_random else "false",
+    }
+    if emo_text:
+        data["emo_text"] = emo_text
+    if emo_vector_json:
+        data["emo_vector_json"] = emo_vector_json
+    if interval_silence is not None:
+        data["interval_silence"] = str(int(interval_silence))
+    if max_text_tokens is not None:
+        data["max_text_tokens_per_segment"] = str(int(max_text_tokens))
+    if temperature is not None:
+        data["temperature"] = str(float(temperature))
+    if top_p is not None:
+        data["top_p"] = str(float(top_p))
+    if top_k is not None:
+        data["top_k"] = str(int(top_k))
+    if repetition_penalty is not None:
+        data["repetition_penalty"] = str(float(repetition_penalty))
+    if max_mel_tokens is not None:
+        data["max_mel_tokens"] = str(int(max_mel_tokens))
+
+    prompt_name = os.path.basename(prompt_wav) or "prompt.wav"
+    files: Dict[str, Any] = {}
+    with ExitStack() as stack:
+        prompt_f = stack.enter_context(open(prompt_wav, "rb"))
+        files["speaker_audio"] = (prompt_name, prompt_f, "audio/wav")
+        if emo_wav:
+            emo_name = os.path.basename(emo_wav) or "emo.wav"
+            emo_f = stack.enter_context(open(emo_wav, "rb"))
+            files["emo_audio"] = (emo_name, emo_f, "audio/wav")
+
+        try:
+            response = requests.post(api_url, data=data, files=files, timeout=max(timeout, 1.0))
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"IndexTTS 请求失败: {exc}")
+
+    content_type = response.headers.get("content-type", "")
+    if content_type.lower().startswith("audio"):
+        seg = AudioSegment.from_file(BytesIO(response.content))
+        seg.export(out_path, format="mp3")
+        return
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail") or payload.get("error")
+        if detail:
+            raise RuntimeError(f"IndexTTS API 错误: {detail}")
+    raise RuntimeError("IndexTTS API 未返回音频数据")
+
+
 # ---------------- TTS：iFLYTEK 私有域 WS ----------------
 def _rfc1123_date():
     import datetime
@@ -611,6 +729,16 @@ def worker_process_one(img_path_str: str,
                        chatts_seed: Optional[int], chatts_lang: Optional[str],
                        chatts_refine: bool, chatts_refine_prompt: Optional[str], chatts_refine_seed: Optional[int],
                        chatts_normalize: bool, chatts_homophone: bool, chatts_timeout: float,
+                       # indextts
+                       indextts_url: Optional[str], indextts_prompt_wav: Optional[str],
+                       indextts_emo_wav: Optional[str],
+                       indextts_emo_text: Optional[str], indextts_use_emo_text: bool,
+                       indextts_emo_alpha: float, indextts_emo_vector_json: Optional[str],
+                       indextts_use_random: bool, indextts_interval_silence: Optional[int],
+                       indextts_max_text_tokens: Optional[int], indextts_temperature: Optional[float],
+                       indextts_top_p: Optional[float], indextts_top_k: Optional[int],
+                       indextts_repetition_penalty: Optional[float], indextts_max_mel_tokens: Optional[int],
+                       indextts_timeout: float,
                        # iflytek
                        ifly_ws_url: Optional[str], ifly_app_id: Optional[str], ifly_key: Optional[str], ifly_secret: Optional[str],
                        ifly_vcn: str, ifly_speed: int, ifly_volume: int, ifly_pitch: int,
@@ -700,6 +828,29 @@ def worker_process_one(img_path_str: str,
                     chatts_normalize,
                     chatts_homophone,
                     chatts_timeout,
+                    audio_path,
+                    on_empty,
+                )
+            elif tts_engine == "indextts":
+                api_url = (indextts_url or "http://127.0.0.1:8000/tts").strip()
+                save_audio_indextts_from_sentences(
+                    sentences,
+                    api_url,
+                    indextts_prompt_wav or "",
+                    indextts_emo_wav,
+                    indextts_emo_text,
+                    bool(indextts_use_emo_text),
+                    float(indextts_emo_alpha),
+                    indextts_emo_vector_json,
+                    bool(indextts_use_random),
+                    indextts_interval_silence,
+                    indextts_max_text_tokens,
+                    indextts_temperature,
+                    indextts_top_p,
+                    indextts_top_k,
+                    indextts_repetition_penalty,
+                    indextts_max_mel_tokens,
+                    indextts_timeout,
                     audio_path,
                     on_empty,
                 )
@@ -819,7 +970,7 @@ def make_clip_with_audio(image_path: Path, audio_path: Path, subtitle_text: Opti
 # ---------------- 主流程 ----------------
 def default_workers(tts_engine: str) -> int:
     n = os.cpu_count() or 4
-    return 2 if tts_engine in ("edge","azure","gtts","elevenlabs","iflytek","chatts") else n
+    return 2 if tts_engine in ("edge","azure","gtts","elevenlabs","iflytek","chatts","indextts") else n
 
 def build_video(images: List[Path], out_path: Path,
                 ocr_engine: str, lang_ocr: str, ocr_psm: int, ocr_oem: int,
@@ -834,6 +985,14 @@ def build_video(images: List[Path], out_path: Path,
                 chatts_seed: Optional[int], chatts_lang: Optional[str],
                 chatts_refine: bool, chatts_refine_prompt: Optional[str], chatts_refine_seed: Optional[int],
                 chatts_normalize: bool, chatts_homophone: bool, chatts_timeout: float,
+                indextts_url: Optional[str], indextts_prompt_wav: Optional[str],
+                indextts_emo_wav: Optional[str], indextts_emo_text: Optional[str],
+                indextts_use_emo_text: bool, indextts_emo_alpha: float,
+                indextts_emo_vector_json: Optional[str], indextts_use_random: bool,
+                indextts_interval_silence: Optional[int], indextts_max_text_tokens: Optional[int],
+                indextts_temperature: Optional[float], indextts_top_p: Optional[float],
+                indextts_top_k: Optional[int], indextts_repetition_penalty: Optional[float],
+                indextts_max_mel_tokens: Optional[int], indextts_timeout: float,
                 # iflytek
                 ifly_ws_url: Optional[str], ifly_app_id: Optional[str], ifly_key: Optional[str], ifly_secret: Optional[str],
                 ifly_vcn: str, ifly_speed: int, ifly_volume: int, ifly_pitch: int,
@@ -876,6 +1035,14 @@ def build_video(images: List[Path], out_path: Path,
                 chatts_seed, chatts_lang,
                 chatts_refine, chatts_refine_prompt, chatts_refine_seed,
                 chatts_normalize, chatts_homophone, chatts_timeout,
+                indextts_url, indextts_prompt_wav,
+                indextts_emo_wav, indextts_emo_text,
+                indextts_use_emo_text, indextts_emo_alpha,
+                indextts_emo_vector_json, indextts_use_random,
+                indextts_interval_silence, indextts_max_text_tokens,
+                indextts_temperature, indextts_top_p,
+                indextts_top_k, indextts_repetition_penalty,
+                indextts_max_mel_tokens, indextts_timeout,
                 ifly_ws_url, ifly_app_id, ifly_key, ifly_secret,
                 ifly_vcn, ifly_speed, ifly_volume, ifly_pitch,
                 ifly_encoding, ifly_sr, ifly_channels, ifly_bit_depth,
@@ -967,7 +1134,7 @@ def main():
     ap.add_argument("--no-binarize", action="store_true")
 
     # TTS 总开关
-    ap.add_argument("--tts-engine", choices=["auto","edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts"], default="auto")
+    ap.add_argument("--tts-engine", choices=["auto","edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts","indextts"], default="auto")
 
     # edge（pitch/style 忽略以兼容老版 edge-tts）
     ap.add_argument("--edge-voice", default=None)
@@ -1046,6 +1213,20 @@ def main():
     args = ap.parse_args()
     load_dotenv(args.env_file)
 
+    env_file_path = Path(args.env_file).expanduser().resolve()
+    env_base_dir = env_file_path.parent
+
+    def resolve_env_path(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = (env_base_dir / path).resolve()
+        return str(path)
+
     images_dir = Path(args.images_dir).expanduser().resolve()
     if not images_dir.exists(): print(f"图片目录不存在：{images_dir}", file=sys.stderr); sys.exit(1)
     images = list_images_sorted(images_dir)
@@ -1056,7 +1237,7 @@ def main():
     ocr_engine = pick_engine(args.ocr_engine, "OCR_VENDOR", "tencent",
                              ["tencent","baidu","rapidocr","tesseract","http"])
     tts_engine = pick_engine(args.tts_engine, "TTS_VENDOR", "edge",
-                             ["edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts"])
+                             ["edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts","indextts"])
     tencent_model = (args.tencent_model or os.getenv("TENCENT_OCR_MODEL","basic")).lower()
     if tencent_model not in ("basic","accurate"): tencent_model = "basic"
 
@@ -1132,6 +1313,43 @@ def main():
     voice_lang = args.voice_lang or os.getenv("GTTS_LANG", "zh-CN")
     voice_name = args.voice_name or os.getenv("PYTTSX3_VOICE", None)
 
+    indextts_emotion = (os.getenv("INDEXTTS_EMOTION") or "neutral").strip().lower()
+    if not indextts_emotion:
+        indextts_emotion = "neutral"
+    indextts_url = os.getenv("INDEXTTS_API_URL", "http://127.0.0.1:8000/tts")
+    indextts_prompt_wav = resolve_env_path(os.getenv("INDEXTTS_PROMPT_WAV"))
+    indextts_emo_wav = resolve_env_path(_env_for_emotion("INDEXTTS_EMO_WAV", indextts_emotion))
+    indextts_emo_text_raw = _env_for_emotion("INDEXTTS_EMO_TEXT", indextts_emotion)
+    indextts_emo_text = indextts_emo_text_raw.strip() if indextts_emo_text_raw else None
+    indextts_use_emo_text = _bool_from(_env_for_emotion("INDEXTTS_USE_EMO_TEXT", indextts_emotion), False)
+    emo_alpha_val = _env_for_emotion("INDEXTTS_EMO_ALPHA", indextts_emotion)
+    indextts_emo_alpha = _maybe_float(emo_alpha_val) if emo_alpha_val is not None else None
+    if indextts_emo_alpha is None:
+        indextts_emo_alpha = 1.0
+    indextts_emo_vector_json_raw = _env_for_emotion("INDEXTTS_EMO_VECTOR_JSON", indextts_emotion)
+    indextts_emo_vector_json = indextts_emo_vector_json_raw.strip() if indextts_emo_vector_json_raw else None
+    indextts_use_random = _bool_from(_env_for_emotion("INDEXTTS_USE_RANDOM", indextts_emotion), False)
+    interval_env = _env_for_emotion("INDEXTTS_INTERVAL_SILENCE", indextts_emotion)
+    indextts_interval_silence = _maybe_int(interval_env)
+    if indextts_interval_silence is None:
+        indextts_interval_silence = 200
+    max_tokens_env = _env_for_emotion("INDEXTTS_MAX_TEXT_TOKENS", indextts_emotion)
+    indextts_max_text_tokens = _maybe_int(max_tokens_env)
+    temperature_env = _env_for_emotion("INDEXTTS_TEMPERATURE", indextts_emotion)
+    indextts_temperature = _maybe_float(temperature_env)
+    top_p_env = _env_for_emotion("INDEXTTS_TOP_P", indextts_emotion)
+    indextts_top_p = _maybe_float(top_p_env)
+    top_k_env = _env_for_emotion("INDEXTTS_TOP_K", indextts_emotion)
+    indextts_top_k = _maybe_int(top_k_env)
+    rep_env = _env_for_emotion("INDEXTTS_REPETITION_PENALTY", indextts_emotion)
+    indextts_repetition_penalty = _maybe_float(rep_env)
+    max_mel_env = _env_for_emotion("INDEXTTS_MAX_MEL_TOKENS", indextts_emotion)
+    indextts_max_mel_tokens = _maybe_int(max_mel_env)
+    timeout_env = _env_for_emotion("INDEXTTS_TIMEOUT", indextts_emotion)
+    indextts_timeout = _maybe_float(timeout_env)
+    if indextts_timeout is None or indextts_timeout <= 0:
+        indextts_timeout = 180.0
+
     # iflytek 优先取命令行，否则取 .env
     ifly_ws_url = args.ifly_ws_url or os.getenv("XFYUN_WS_URL")
     ifly_app_id = args.ifly_app_id or os.getenv("XFYUN_APPID")
@@ -1150,6 +1368,19 @@ def main():
         if missing_cfg:
             print("讯飞私有域缺少配置：" + ", ".join(missing_cfg), file=sys.stderr)
             sys.exit(1)
+    if tts_engine == "indextts":
+        if not indextts_prompt_wav:
+            print("缺少 IndexTTS 参考音频（请通过 INDEXTTS_PROMPT_WAV 设置）", file=sys.stderr)
+            sys.exit(1)
+        prompt_path = Path(indextts_prompt_wav)
+        if not prompt_path.exists():
+            print(f"IndexTTS 参考音频不存在：{prompt_path}", file=sys.stderr)
+            sys.exit(1)
+        if indextts_emo_wav:
+            emo_path = Path(indextts_emo_wav)
+            if not emo_path.exists():
+                print(f"IndexTTS 情感参考音频不存在：{emo_path}", file=sys.stderr)
+                sys.exit(1)
 
     build_video(
         images=images,
@@ -1172,6 +1403,14 @@ def main():
         chatts_seed=chatts_seed, chatts_lang=chatts_lang,
         chatts_refine=chatts_refine, chatts_refine_prompt=chatts_refine_prompt, chatts_refine_seed=chatts_refine_seed,
         chatts_normalize=chatts_normalize, chatts_homophone=chatts_homophone, chatts_timeout=chatts_timeout,
+        indextts_url=indextts_url, indextts_prompt_wav=indextts_prompt_wav,
+        indextts_emo_wav=indextts_emo_wav, indextts_emo_text=indextts_emo_text,
+        indextts_use_emo_text=indextts_use_emo_text, indextts_emo_alpha=indextts_emo_alpha,
+        indextts_emo_vector_json=indextts_emo_vector_json, indextts_use_random=indextts_use_random,
+        indextts_interval_silence=indextts_interval_silence, indextts_max_text_tokens=indextts_max_text_tokens,
+        indextts_temperature=indextts_temperature, indextts_top_p=indextts_top_p,
+        indextts_top_k=indextts_top_k, indextts_repetition_penalty=indextts_repetition_penalty,
+        indextts_max_mel_tokens=indextts_max_mel_tokens, indextts_timeout=indextts_timeout,
         ifly_ws_url=ifly_ws_url, ifly_app_id=ifly_app_id, ifly_key=ifly_key, ifly_secret=ifly_secret,
         ifly_vcn=args.ifly_vcn, ifly_speed=args.ifly_speed, ifly_volume=args.ifly_volume, ifly_pitch=args.ifly_pitch,
         ifly_encoding=args.ifly_encoding, ifly_sr=args.ifly_sr, ifly_channels=args.ifly_channels, ifly_bit_depth=args.ifly_bit_depth,
