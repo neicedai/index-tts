@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from io import BytesIO
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -111,6 +111,21 @@ def clean_text_for_manhua(raw: str) -> str:
             continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def filter_text_by_keywords(text: str, keywords: Sequence[str]) -> str:
+    """Remove lines that contain any of the provided keywords."""
+    if not text or not keywords:
+        return text
+    filtered_lines: List[str] = []
+    for line in text.splitlines():
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        if any(kw and kw in line_stripped for kw in keywords):
+            continue
+        filtered_lines.append(line_stripped)
+    return "\n".join(filtered_lines).strip()
 
 _SENT_PAT = re.compile(r'[^。！？!?；;：:…]+[。！？!?；;：:…]{0,2}(?:"|”|\'|’)?')
 
@@ -746,7 +761,8 @@ def worker_process_one(img_path_str: str,
                        ifly_oral_level: str, ifly_stop_split: int, ifly_remain: int,
                        ifly_by_sent: bool, ifly_pause_ms: int,
                        audio_dir_str: str, text_dir_str: str,
-                       on_empty: str, pad_silence: float, debug: bool, force_ocr: bool):
+                       on_empty: str, pad_silence: float, debug: bool, force_ocr: bool,
+                       filter_keywords: Tuple[str, ...]):
     img_path = Path(img_path_str)
     audio_dir, text_dir = Path(audio_dir_str), Path(text_dir_str)
 
@@ -780,6 +796,8 @@ def worker_process_one(img_path_str: str,
                                  ocr_crop, strip_border, ocr_scale, binarize,
                                  tencent_model, debug)
             text = clean_text_for_manhua(raw_text)
+            if filter_keywords:
+                text = filter_text_by_keywords(text, filter_keywords)
         except Exception as e:
             print(f"[OCR-ERR] {ocr_engine} {img_path.name}: {e}", file=sys.stderr)
             raise
@@ -787,6 +805,11 @@ def worker_process_one(img_path_str: str,
     else:
         text = text_path.read_text(encoding="utf-8", errors="ignore")
         if debug: print(f"[OCR] cache HIT -> {img_path.name} (chars={len(text)})")
+        if filter_keywords:
+            filtered = filter_text_by_keywords(text, filter_keywords)
+            if filtered != text:
+                text = filtered
+                text_path.write_text(text, encoding="utf-8")
 
     try:
         with open(stamp_path, "w", encoding="utf-8") as f:
@@ -1005,7 +1028,8 @@ def build_video(images: List[Path], out_path: Path,
                 fast_concat: bool, enc_workers: int, enc_threads: int,
                 enc_preset: str, enc_crf: int,
                 debug: bool, force_ocr: bool,
-                skip_stems: str, skip_silence_sec: float):
+                skip_stems: str, skip_silence_sec: float,
+                filter_keywords: Tuple[str, ...]):
     work = out_path.parent / "_ctv_build"
     audio_dir, text_dir, seg_dir = work/"audio", work/"text", work/"seg"
     for d in (work, audio_dir, text_dir, seg_dir): d.mkdir(parents=True, exist_ok=True)
@@ -1049,7 +1073,8 @@ def build_video(images: List[Path], out_path: Path,
                 ifly_oral_level, ifly_stop_split, ifly_remain,
                 ifly_by_sent, ifly_pause_ms,
                 str(audio_dir), str(text_dir),
-                on_empty, pad_silence, debug, force_ocr
+                on_empty, pad_silence, debug, force_ocr,
+                filter_keywords
             ))
         for f in as_completed(futs):
             img_path, text_path, audio_path, dur = f.result()
@@ -1207,8 +1232,13 @@ def main():
     ap.add_argument("--enc-crf", type=int, default=23)
 
     # 跳过页
-    ap.add_argument("--skip-stems", default="", help="例：01,01p")
-    ap.add_argument("--skip-silence-sec", type=float, default=1.0)
+    default_skip_stems = ""
+    default_skip_silence = 1.0
+    default_filter_keywords = ""
+
+    ap.add_argument("--skip-stems", default=default_skip_stems, help="例：01,01p")
+    ap.add_argument("--skip-silence-sec", type=float, default=default_skip_silence)
+    ap.add_argument("--filter-keywords", default=default_filter_keywords, help="逗号分隔，出现则整行丢弃")
 
     args = ap.parse_args()
     load_dotenv(args.env_file)
@@ -1382,6 +1412,25 @@ def main():
                 print(f"IndexTTS 情感参考音频不存在：{emo_path}", file=sys.stderr)
                 sys.exit(1)
 
+    skip_stems_value = args.skip_stems
+    if skip_stems_value == default_skip_stems:
+        skip_stems_value = os.getenv("SKIP_STEMS", default_skip_stems)
+
+    skip_silence_value = args.skip_silence_sec
+    if skip_silence_value == default_skip_silence:
+        skip_silence_env = os.getenv("SKIP_SILENCE_SEC")
+        if skip_silence_env is not None and skip_silence_env.strip():
+            try:
+                skip_silence_value = float(skip_silence_env)
+            except ValueError:
+                print(f"无效的 SKIP_SILENCE_SEC：{skip_silence_env}，已回退为 {default_skip_silence}", file=sys.stderr)
+                skip_silence_value = default_skip_silence
+
+    filter_keywords_value = args.filter_keywords
+    if filter_keywords_value == default_filter_keywords:
+        filter_keywords_value = os.getenv("FILTER_KEYWORDS", default_filter_keywords)
+    filter_keywords_tuple = tuple([kw.strip() for kw in filter_keywords_value.replace("\n", ",").split(",") if kw.strip()])
+
     build_video(
         images=images,
         out_path=out_path,
@@ -1425,7 +1474,8 @@ def main():
         enc_workers=args.enc_workers, enc_threads=args.enc_threads,
         enc_preset=args.enc_preset, enc_crf=args.enc_crf,
         debug=args.debug, force_ocr=args.force_ocr,
-        skip_stems=args.skip_stems, skip_silence_sec=args.skip_silence_sec,
+        skip_stems=skip_stems_value, skip_silence_sec=skip_silence_value,
+        filter_keywords=filter_keywords_tuple,
     )
 
 if __name__ == "__main__":
