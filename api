@@ -9,6 +9,7 @@ from typing import Optional
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from indextts.infer_v2 import IndexTTS2
 
 app = FastAPI(title="IndexTTS2 API")
@@ -46,8 +47,8 @@ async def synthesize(
 ):
     emo_vector = json.loads(emo_vector_json) if emo_vector_json else None
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
         prompt_path = tmpdir / "prompt.wav"
         _save_upload(speaker_audio, prompt_path)
 
@@ -81,4 +82,8 @@ async def synthesize(
             output_path,
             media_type="audio/wav",
             filename="tts.wav",
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
         )
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
