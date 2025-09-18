@@ -104,6 +104,7 @@ def clean_text_for_manhua(raw: str) -> str:
     lines = []
     for line in raw.splitlines():
         line = re.sub(r'^\s*[\(（]\s*\d+\s*[\)）]\s*', '', line)
+        line = re.sub(r'^\s*[\(（]\s*[＊*]+\s*[\)）]?\s*', '', line)
         line = re.sub(r'(?i)www\.lhhl\.com', '', line)
         line = re.sub(r'向日葵连环画', '', line)
         line = line.strip()
