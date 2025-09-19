@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from io import BytesIO
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Sequence
+from typing import List, Tuple, Optional, Dict, Any, Sequence, NamedTuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -107,18 +107,43 @@ def convert_pdf_to_images(pdf_path: Path, out_dir: Path, dpi: int = 300) -> List
     return images
 
 
-def prepare_images(input_path: Path) -> Tuple[Path, List[Path], Optional[tempfile.TemporaryDirectory]]:
+class PrepareImagesResult(NamedTuple):
+    images_dir: Path
+    images: List[Path]
+    temp_ctx: Optional[tempfile.TemporaryDirectory]
+    pdf_source: Optional[Path]
+    pdf_candidates: List[Path]
+
+
+def prepare_images(input_path: Path) -> PrepareImagesResult:
     """Resolve images from *input_path*.
 
-    Returns a tuple of (directory_holding_images, image_paths, temp_dir_context).
-    Caller is responsible for cleaning up the temp_dir_context (if not None).
+    Returns a :class:`PrepareImagesResult` describing the resolved images, any
+    temporary directory that needs clean-up, and metadata about PDF discovery.
+    Caller is responsible for cleaning up the ``temp_ctx`` (if not ``None``).
     """
     if not input_path.exists():
         raise FileNotFoundError(str(input_path))
 
     if input_path.is_dir():
         images = list_images_sorted(input_path)
-        return input_path, images, None
+        if images:
+            return PrepareImagesResult(input_path, images, None, None, [])
+
+        pdf_candidates = [
+            p for p in input_path.iterdir()
+            if p.is_file() and p.suffix.lower() == ".pdf"
+        ]
+        pdf_candidates.sort(key=lambda p: natural_key(p.name))
+        if pdf_candidates:
+            pdf_path = pdf_candidates[0]
+            tmp_ctx = tempfile.TemporaryDirectory(prefix="ctv_pdf_")
+            tmp_dir = Path(tmp_ctx.name)
+            images = convert_pdf_to_images(pdf_path, tmp_dir)
+            images.sort(key=lambda p: natural_key(p.name))
+            return PrepareImagesResult(tmp_dir, images, tmp_ctx, pdf_path, pdf_candidates)
+
+        return PrepareImagesResult(input_path, [], None, None, [])
 
     suffix = input_path.suffix.lower()
     if suffix == ".pdf" and input_path.is_file():
@@ -126,7 +151,7 @@ def prepare_images(input_path: Path) -> Tuple[Path, List[Path], Optional[tempfil
         tmp_dir = Path(tmp_ctx.name)
         images = convert_pdf_to_images(input_path, tmp_dir)
         images.sort(key=lambda p: natural_key(p.name))
-        return tmp_dir, images, tmp_ctx
+        return PrepareImagesResult(tmp_dir, images, tmp_ctx, input_path, [input_path])
 
     raise ValueError(f"不支持的输入：{input_path}")
 
@@ -1314,9 +1339,16 @@ def main():
 
     input_path = Path(args.images_dir).expanduser().resolve()
     temp_ctx: Optional[tempfile.TemporaryDirectory] = None
+    pdf_source: Optional[Path] = None
+    pdf_candidates: List[Path] = []
     try:
         try:
-            images_dir, images, temp_ctx = prepare_images(input_path)
+            prep_result = prepare_images(input_path)
+            images_dir = prep_result.images_dir
+            images = prep_result.images
+            temp_ctx = prep_result.temp_ctx
+            pdf_source = prep_result.pdf_source
+            pdf_candidates = prep_result.pdf_candidates
         except FileNotFoundError:
             print(f"图片目录不存在：{input_path}", file=sys.stderr)
             sys.exit(1)
@@ -1328,14 +1360,22 @@ def main():
             sys.exit(1)
 
         if not images:
-            if input_path.suffix.lower() == ".pdf" and input_path.is_file():
-                print(f"PDF 文件中没有可用的页面：{input_path}", file=sys.stderr)
+            if pdf_source is not None:
+                if input_path.is_dir():
+                    print(f"目录中的 PDF 文件中没有可用的页面：{pdf_source}", file=sys.stderr)
+                else:
+                    print(f"PDF 文件中没有可用的页面：{pdf_source}", file=sys.stderr)
+            elif input_path.is_dir() and not pdf_candidates:
+                print(f"目录中没有图片也没有 PDF 文件：{input_path}", file=sys.stderr)
             else:
-                print(f"目录中没有图片：{images_dir}", file=sys.stderr)
+                print(f"目录中没有图片：{input_path}", file=sys.stderr)
             sys.exit(1)
 
-        if input_path.suffix.lower() == ".pdf" and input_path.is_file():
-            print(f">>> 已从 PDF 载入 {len(images)} 页：{input_path.name}")
+        if pdf_source is not None:
+            if input_path.is_dir():
+                print(f">>> 已从目录中的 PDF 载入 {len(images)} 页：{pdf_source.name}")
+            else:
+                print(f">>> 已从 PDF 载入 {len(images)} 页：{pdf_source.name}")
 
         out_path = Path(args.out).expanduser().resolve()
 
