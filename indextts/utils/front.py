@@ -12,6 +12,8 @@ class TextNormalizer:
     def __init__(self):
         self.zh_normalizer = None
         self.en_normalizer = None
+        self.zh_converter = None
+        self._converter_initialized = False
         self.char_rep_map = {
             "：": ",",
             "；": ",",
@@ -89,7 +91,7 @@ class TextNormalizer:
         # print(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
         # sys.path.append(model_dir)
         import platform
-        if self.zh_normalizer is not None and self.en_normalizer is not None:
+        if self.zh_normalizer is not None and self.en_normalizer is not None and self._converter_initialized:
             return
         if platform.system() != "Linux":  # Mac and Windows
             from wetext import Normalizer
@@ -109,6 +111,46 @@ class TextNormalizer:
                 cache_dir=cache_dir, remove_interjections=False, remove_erhua=False, overwrite_cache=False
             )
             self.en_normalizer = NormalizerEn(overwrite_cache=False)
+        if not self._converter_initialized:
+            self._initialize_converter()
+
+    def _initialize_converter(self):
+        if self._converter_initialized:
+            return
+        try:
+            from opencc import OpenCC
+        except ModuleNotFoundError:
+            warnings.warn(
+                "OpenCC is not installed. Traditional Chinese text will not be converted to Simplified.",
+                RuntimeWarning,
+            )
+            self._converter_initialized = True
+            return
+        except Exception as exc:
+            warnings.warn(f"Failed to import OpenCC: {exc}", RuntimeWarning)
+            self._converter_initialized = True
+            return
+        try:
+            self.zh_converter = OpenCC("t2s")
+        except Exception as exc:
+            warnings.warn(f"Failed to initialize OpenCC converter: {exc}", RuntimeWarning)
+            self.zh_converter = None
+        self._converter_initialized = True
+
+    def _maybe_convert_traditional(self, text: str) -> str:
+        if not text:
+            return text
+        if not self._converter_initialized:
+            self._initialize_converter()
+        if self.zh_converter is None:
+            return text
+        try:
+            converted = self.zh_converter.convert(text)
+        except Exception as exc:
+            warnings.warn(f"OpenCC conversion failed: {exc}. Disabling converter.", RuntimeWarning)
+            self.zh_converter = None
+            return text
+        return converted
 
     def normalize(self, text: str) -> str:
         if not self.zh_normalizer or not self.en_normalizer:
@@ -117,8 +159,9 @@ class TextNormalizer:
         if self.use_chinese(text):
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             replaced_text, pinyin_list = self.save_pinyin_tones(text.rstrip())
-            
+
             replaced_text, original_name_list = self.save_names(replaced_text)
+            replaced_text = self._maybe_convert_traditional(replaced_text)
             try:
                 result = self.zh_normalizer.normalize(replaced_text)
             except Exception:
