@@ -46,6 +46,7 @@ dependencies = [
   "numpy==1.26.2",
   "omegaconf>=2.3.0",
   "opencv-python==4.9.0.80",
+  "pypdfium2>=4.30.0",
   "pandas==2.3.2",
   "safetensors==0.5.2",
   "sentencepiece>=0.2.1",
