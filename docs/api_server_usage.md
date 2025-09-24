@@ -36,6 +36,72 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 
 接口返回 `audio/wav` 文件，文件名为 `tts.wav`。
 
+### 参数使用示例
+
+下列 `curl` 片段演示了各字段常见的组合方式，可按需复制拼装：
+
+- **最小化请求（必须字段）**：
+
+  ```bash
+  curl -X POST "http://localhost:8000/tts" \
+    -F "text=欢迎使用 IndexTTS2" \
+    -F "speaker_audio=@examples/voice_01.wav" \
+    --output tts_basic.wav
+  ```
+
+- **引用情感参考音频 (`emo_audio`) 并放大情感权重 (`emo_alpha`)**：
+
+  ```bash
+  curl -X POST "http://localhost:8000/tts" \
+    -F "text=今天的演出真是太棒了！" \
+    -F "speaker_audio=@examples/voice_02.wav" \
+    -F "emo_audio=@examples/voice_02_emotion.wav" \
+    -F "emo_alpha=0.9" \
+    --output tts_emo_audio.wav
+  ```
+
+- **使用情感文本模式 (`use_emo_text`/`emo_text`) 并开启随机采样 (`use_random`)**：
+
+  ```bash
+  curl -X POST "http://localhost:8000/tts" \
+    -F "text=我们一起冲刺最后一公里！" \
+    -F "speaker_audio=@examples/voice_03.wav" \
+    -F "use_emo_text=true" \
+    -F "emo_text=激动又兴奋地为大家加油" \
+    -F "emo_alpha=0.7" \
+    -F "use_random=true" \
+    --output tts_emo_text.wav
+  ```
+
+- **指定情感向量 (`emo_vector_json`) 并拉长句段停顿 (`interval_silence`)**：
+
+  ```bash
+  curl -X POST "http://localhost:8000/tts" \
+    -F "text=请在下一段落中跟随我的节奏" \
+    -F "speaker_audio=@examples/voice_04.wav" \
+    -F "emo_vector_json=[0.4,0,0,0,0,0,0.3,0.3]" \
+    -F "emo_alpha=0.6" \
+    -F "interval_silence=400" \
+    --output tts_emo_vector.wav
+  ```
+
+- **控制文本切分 (`max_text_tokens_per_segment`) 与生成解码参数**：
+
+  ```bash
+  curl -X POST "http://localhost:8000/tts" \
+    -F "text=以下内容将以播报风格缓慢读出，请保持安静倾听。" \
+    -F "speaker_audio=@examples/voice_05.wav" \
+    -F "max_text_tokens_per_segment=80" \
+    -F "temperature=0.6" \
+    -F "top_p=0.7" \
+    -F "top_k=20" \
+    -F "repetition_penalty=6.0" \
+    -F "max_mel_tokens=2000" \
+    --output tts_decoder_tuned.wav
+  ```
+
+上述示例可灵活组合，例如同时使用情感向量与随机采样，或在情感文本模式下调整 `interval_silence` 与 `max_mel_tokens` 等高级参数。
+
 ## 情感控制方式
 
 `IndexTTS2` 提供三种互斥的情感引导手段：情感参考音频、情感文本、情感向量。`api_server.py` 中的推理逻辑会根据下列优先级启用对应模式：
