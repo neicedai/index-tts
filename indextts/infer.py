@@ -3,7 +3,7 @@ import os
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
 import time
 from subprocess import CalledProcessError
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torchaudio
@@ -27,7 +27,7 @@ from indextts.utils.front import TextNormalizer, TextTokenizer
 class IndexTTS:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=True, device=None,
-            use_cuda_kernel=None,
+            use_cuda_kernel=None, cpu_threads: Optional[int] = None,
     ):
         """
         Args:
@@ -36,7 +36,19 @@ class IndexTTS:
             use_fp16 (bool): whether to use fp16.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
+            cpu_threads (int | None): override the number of CPU threads used by PyTorch when running purely on the CPU.
         """
+        if cpu_threads is not None and cpu_threads < 1:
+            raise ValueError("cpu_threads must be an integer greater than 0")
+        if cpu_threads is None:
+            env_threads = os.getenv("INDEXTTS_CPU_THREADS")
+            if env_threads:
+                try:
+                    cpu_threads = max(1, int(env_threads))
+                except ValueError:
+                    raise ValueError("INDEXTTS_CPU_THREADS must be an integer greater than 0") from None
+
+        self.cpu_threads = cpu_threads
         if device is not None:
             self.device = device
             self.use_fp16 = False if device == "cpu" else use_fp16
@@ -58,6 +70,16 @@ class IndexTTS:
             self.use_fp16 = False
             self.use_cuda_kernel = False
             print(">> Be patient, it may take a while to run in CPU mode.")
+            desired_threads = self.cpu_threads or os.cpu_count() or 1
+            try:
+                torch.set_num_threads(desired_threads)
+                # Limit interop threads to avoid oversubscription when intra-op parallelism is high.
+                interop_threads = min(desired_threads, 4)
+                torch.set_num_interop_threads(max(1, interop_threads))
+            except RuntimeError:
+                # set_num_interop_threads can raise when the backend lacks thread pools (e.g. OpenMP builds).
+                pass
+            print(f">> Using {torch.get_num_threads()} CPU threads for inference")
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
@@ -97,7 +119,9 @@ class IndexTTS:
 
             self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=True)
         else:
-            self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=False, half=False)
+            # CPU推理时启用KV缓存可以避免重复计算历史token，对长文本生成性能提升明显。
+            enable_kv_cache = self.device == "cpu"
+            self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=enable_kv_cache, half=False)
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
