@@ -97,7 +97,9 @@ class IndexTTS:
 
             self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=True)
         else:
-            self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=False, half=False)
+            # CPU推理时启用KV缓存可以避免重复计算历史token，对长文本生成性能提升明显。
+            enable_kv_cache = self.device == "cpu"
+            self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=enable_kv_cache, half=False)
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
