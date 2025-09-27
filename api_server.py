@@ -26,7 +26,7 @@ def _resolve_devices() -> List[Optional[str]]:
 
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
-        if device_count >= 2:
+        if device_count >= 3:
             return [f"cuda:{i}" for i in range(2)]
         return ["cuda:0"]
     return [None]
