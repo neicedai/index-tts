@@ -49,6 +49,10 @@ class IndexTTS2:
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
             use_deepspeed (bool): whether to use DeepSpeed or not.
         """
+        low_vram_override = os.getenv("INDEXTTS_LOW_VRAM", "auto").lower()
+        self.low_vram_mode = False
+        self.device_total_memory_gb = None
+
         if device is not None:
             self.device = device
             self.use_fp16 = False if device == "cpu" else use_fp16
@@ -70,6 +74,24 @@ class IndexTTS2:
             self.use_fp16 = False
             self.use_cuda_kernel = False
             print(">> Be patient, it may take a while to run in CPU mode.")
+
+        if isinstance(self.device, str) and self.device.startswith("cuda"):
+            try:
+                properties = torch.cuda.get_device_properties(torch.device(self.device))
+                self.device_total_memory_gb = properties.total_memory / (1024 ** 3)
+            except Exception:
+                self.device_total_memory_gb = None
+
+        if low_vram_override in {"1", "true", "yes", "on"}:
+            self.low_vram_mode = True
+        elif low_vram_override in {"0", "false", "no", "off"}:
+            self.low_vram_mode = False
+        elif self.device_total_memory_gb is not None:
+            try:
+                threshold_gb = float(os.getenv("INDEXTTS_LOW_VRAM_THRESHOLD", "8"))
+            except ValueError:
+                threshold_gb = 8.0
+            self.low_vram_mode = self.device_total_memory_gb <= threshold_gb
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
@@ -95,7 +117,20 @@ class IndexTTS2:
                 use_deepspeed = False
                 print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
 
-        self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=self.use_fp16)
+        kv_cache_override = os.getenv("INDEXTTS_ENABLE_KV_CACHE")
+        if kv_cache_override is not None:
+            kv_cache_override = kv_cache_override.lower()
+            enable_kv_cache = kv_cache_override in {"1", "true", "yes", "on"}
+        else:
+            enable_kv_cache = not self.low_vram_mode
+
+        self.enable_kv_cache = enable_kv_cache
+
+        self.gpt.post_init_gpt2_config(
+            use_deepspeed=use_deepspeed,
+            kv_cache=self.enable_kv_cache,
+            half=self.use_fp16,
+        )
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -183,6 +218,33 @@ class IndexTTS2:
             "center": False
         }
         self.mel_fn = lambda x: mel_spectrogram(x, **mel_fn_args)
+
+        default_num_beams = 1 if self.low_vram_mode else 3
+        try:
+            num_beams_override = os.getenv("INDEXTTS_NUM_BEAMS")
+            if num_beams_override is not None:
+                default_num_beams = max(1, int(num_beams_override))
+        except ValueError:
+            pass
+        self.default_num_beams = default_num_beams
+
+        default_max_mel_tokens = 1200 if self.low_vram_mode else 1500
+        try:
+            max_mel_override = os.getenv("INDEXTTS_MAX_MEL_TOKENS")
+            if max_mel_override is not None:
+                default_max_mel_tokens = max(256, int(max_mel_override))
+        except ValueError:
+            pass
+        self.default_max_mel_tokens = default_max_mel_tokens
+
+        if self.low_vram_mode:
+            message = [">> Low VRAM mode enabled"]
+            if self.device_total_memory_gb is not None:
+                message.append(f"(detected {self.device_total_memory_gb:.1f} GiB)")
+            message.append(
+                f"; defaults: num_beams={self.default_num_beams}, max_mel_tokens={self.default_max_mel_tokens}, kv_cache={'on' if self.enable_kv_cache else 'off'}"
+            )
+            print(" ".join(message))
 
         # 缓存参考音频：
         self.cache_spk_cond = None
@@ -458,9 +520,9 @@ class IndexTTS2:
         temperature = generation_kwargs.pop("temperature", 0.8)
         autoregressive_batch_size = 1
         length_penalty = generation_kwargs.pop("length_penalty", 0.0)
-        num_beams = generation_kwargs.pop("num_beams", 3)
+        num_beams = generation_kwargs.pop("num_beams", self.default_num_beams)
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
-        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", self.default_max_mel_tokens)
         sampling_rate = 22050
 
         wavs = []
@@ -470,6 +532,8 @@ class IndexTTS2:
         bigvgan_time = 0
         has_warned = False
         for seg_idx, sent in enumerate(segments):
+            if self.low_vram_mode and torch.cuda.is_available():
+                torch.cuda.empty_cache()
             self._set_gr_progress(0.2 + 0.7 * seg_idx / segments_count,
                                   f"speech synthesis {seg_idx + 1}/{segments_count}...")
 
