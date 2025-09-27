@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -31,29 +32,58 @@ def _resolve_devices() -> List[Optional[str]]:
     return [None]
 
 
+def _should_enable_fp16(device: Optional[str], override: str) -> bool:
+    """Decide whether fp16 inference should be enabled for a device."""
+
+    override = override.lower()
+    if override in {"1", "true", "yes", "on"}:
+        return device is not None and device.startswith("cuda")
+    if override in {"0", "false", "no", "off"}:
+        return False
+
+    if device is None or not device.startswith("cuda"):
+        return False
+
+    try:
+        capability = torch.cuda.get_device_capability(torch.device(device))
+        # Devices with compute capability >= 5.3 have native fp16 support.
+        return capability[0] > 5 or (capability[0] == 5 and capability[1] >= 3)
+    except Exception:
+        # If capability cannot be queried, assume fp16 is supported.
+        return True
+
+
 def _init_tts_instances() -> List[IndexTTS2]:
     devices = _resolve_devices()
     instances: List[IndexTTS2] = []
+    precisions: List[str] = []
+    fp16_override = os.getenv("INDEXTTS_USE_FP16", "auto")
 
     for device in devices:
+        use_fp16 = _should_enable_fp16(device, fp16_override)
         instances.append(
             IndexTTS2(
                 cfg_path="checkpoints/config.yaml",
                 model_dir="checkpoints",
-                use_fp16=False,
+                use_fp16=use_fp16,
                 device=device,
             )
         )
+        precisions.append("fp16" if use_fp16 else "fp32")
 
     if len(instances) > 1:
+        description = ", ".join(
+            f"{device or 'auto'} ({precision})"
+            for device, precision in zip(devices, precisions)
+        )
         print(
             ">> Multi-GPU inference enabled on devices:",
-            ", ".join(device or "auto" for device in devices),
+            description,
         )
     else:
         print(
             ">> Single model instance initialised on device:",
-            devices[0] or "auto",
+            f"{devices[0] or 'auto'} ({precisions[0]})",
         )
 
     return instances
